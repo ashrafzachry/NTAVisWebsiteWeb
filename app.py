@@ -7,255 +7,217 @@ import plotly.express as px
 import pyotp
 import smtplib
 from email.mime.text import MIMEText
+from email.header import Header
+from email.utils import formataddr
+import json
+import os
 
-DB_PATH = "packets.db"
+# --- Page & App Configuration ---
+st.set_page_config(page_title="NTAVis Dashboard", layout="wide", page_icon="🌐")
 
-PROTOCOL_MAP = {
-    1: "ICMP",
-    6: "TCP",
-    17: "UDP",
-    2: "IGMP"
-}
+# --- Constants & Mappings ---
+DB_PATH = "/home/hadifshah/NTAVisProject/packets.db"
+PROTOCOL_MAP = {1: "ICMP", 6: "TCP", 17: "UDP", 2: "IGMP"}
+USER_DATA_FILE = "user_data.json"
 
-def get_data():
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT * FROM packets", conn)
-    conn.close()
-    if "protocol" in df.columns:
-        df["protocol"] = df["protocol"].apply(lambda x: PROTOCOL_MAP.get(int(x), str(x)) if pd.notnull(x) else "Unknown")
-    return df
-
-def get_counts():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT threat_type, COUNT(*) FROM packets GROUP BY threat_type")
-    results = cursor.fetchall()
-    conn.close()
-    counts = {row[0]: row[1] for row in results}
-    suspicious_count = counts.get("Suspicious", 0)
-    malformed_count = counts.get("Malformed", 0)
-    syn_flood_count = counts.get("SYN Flood", 0)
-    udp_flood_count = counts.get("UDP Flood", 0)
-    return suspicious_count, malformed_count, syn_flood_count, udp_flood_count
-
-# --- OTP Email Sender ---
-def send_otp(otp, recipient_email):
-    sender_email = "hadifshah178@gmail.com"
-    app_password = "cxttnohgofnafidv"  # Use Gmail App Password here
-
-    subject = "Your NTAVis OTP Code"
-    body = f"Your OTP code is: {otp}"
-
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = sender_email
-    msg["To"] = recipient_email
-
+# --- User Data Functions ---
+def load_user_data():
+    if not os.path.exists(USER_DATA_FILE):
+        return {}
     try:
+        with open(USER_DATA_FILE, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_user_data(data):
+    with open(USER_DATA_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
+
+# --- Data Loading ---
+@st.cache_data(ttl=10)
+def get_data():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_sql_query("SELECT * FROM packets", conn)
+        conn.close()
+        if "protocol" in df.columns:
+            df["protocol"] = df["protocol"].apply(lambda x: PROTOCOL_MAP.get(int(x), str(x)) if pd.notnull(x) else "Unknown")
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+# --- OTP & Login Logic (FINAL) ---
+def login_page():
+    col1, col2, col3 = st.columns([1, 1.2, 1])
+    with col2:
+        st.title("NTAVis Dashboard")
+        st.markdown("Please sign in to continue.")
+
+        user_data = load_user_data()
+        is_known_user = st.secrets["login"]["username"] in user_data
+
+        if is_known_user:
+            # --- PATH FOR RETURNING USERS (NO OTP) ---
+            with st.form("login_form"):
+                username = st.text_input("Username", value=st.secrets["login"]["username"])
+                password = st.text_input("Password", type="password")
+                submitted = st.form_submit_button("Login")
+
+                if submitted:
+                    is_correct = (username.strip() == st.secrets["login"]["username"] and password.strip() == st.secrets["login"]["password"])
+                    if is_correct:
+                        st.session_state["logged_in"] = True
+                        st.success("Login successful!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Incorrect username or password.")
+        else:
+            # --- PATH FOR FIRST-TIME USERS (OTP REQUIRED) ---
+            if not st.session_state.get("otp_sent"):
+                with st.form("first_login_form"):
+                    username = st.text_input("Username")
+                    password = st.text_input("Password", type="password")
+                    email = st.text_input("Email (for first-time verification)")
+                    submitted = st.form_submit_button("Send OTP")
+
+                    if submitted:
+                        is_correct = (username.strip() == st.secrets["login"]["username"] and password.strip() == st.secrets["login"]["password"])
+                        if is_correct:
+                            if not email:
+                                st.error("Email is required for the first login.")
+                                return
+                            st.session_state["totp"] = pyotp.TOTP(pyotp.random_base32())
+                            if send_otp(st.session_state["totp"].now(), email):
+                                st.session_state["otp_sent"] = True
+                                st.session_state["email_to_save"] = email.strip()
+                                st.success(f"OTP sent to {email}! Please check your email.")
+                                st.rerun()
+                        else:
+                            st.error("❌ Incorrect username or password.")
+            else:
+                with st.form("otp_form"):
+                    otp_input = st.text_input("Enter OTP from your email")
+                    submitted = st.form_submit_button("Verify OTP")
+                    if submitted:
+                        if st.session_state.get("totp") and st.session_state["totp"].verify(otp_input.strip(), valid_window=2):
+                            user_data[st.secrets["login"]["username"]] = st.session_state["email_to_save"]
+                            save_user_data(user_data)
+                            
+                            st.session_state["logged_in"] = True
+                            st.session_state["otp_sent"] = False
+                            st.success("Login successful! Future logins will not require OTP.")
+                            st.rerun()
+                        else:
+                            st.error("Invalid OTP.")
+
+def send_otp(otp, recipient_email):
+    try:
+        sender_email = st.secrets["gmail"]["email"]
+        app_password = st.secrets["gmail"]["app_password"]
+        msg = MIMEText(f"Your OTP code is: {otp}")
+        msg["Subject"] = "Your NTAVis OTP Code"
+        msg["From"] = formataddr((str(Header('NTAVis OTP', 'utf-8')), sender_email))
+        msg["To"] = recipient_email
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(sender_email, app_password)
             server.sendmail(sender_email, recipient_email, msg.as_string())
-        st.info("OTP sent to your email!")
+        return True
     except Exception as e:
-        st.error(f"Failed to send OTP: {e}")
+        st.error(f"Failed to send OTP. Check your secrets.toml file. Error: {e}")
+        return False
 
-# --- Modern OTP Login Page ---
-def otp_login():
-    if "otp_sent" not in st.session_state:
-        st.session_state["otp_sent"] = False
-    if "otp_verified" not in st.session_state:
-        st.session_state["otp_verified"] = False
+# --- Main App Logic ---
+def main():
+    if "logged_in" not in st.session_state: st.session_state.logged_in = False
+    if "otp_sent" not in st.session_state: st.session_state.otp_sent = False
 
-    st.markdown("""
-        <style>
-        .login-card {
-            background-color: #f8f9fa;
-            padding: 32px 28px 18px 28px;
-            border-radius: 18px;
-            box-shadow: 0 4px 16px rgba(44,62,80,0.10);
-            text-align: center;
-            width: 350px;
-            margin: auto;
-            color: #222 !important;
-        }
-        .login-title {
-            font-size: 1.4rem;
-            margin-bottom: 10px;
-            margin-top: 8px;
-            color: #222 !important;
-        }
-        </style>
-        <div style="display: flex; justify-content: center; align-items: center; margin-top: 10vh;">
-            <div class="login-card">
-                <img src="https://learn.g2.com/hs-fs/hubfs/G2CM_FI634_Learn_Article_Images_%5BNetwork_traffic_analysis%5D_V1a.png?width=690&name=G2CM_FI634_Learn_Article_Images_%5BNetwor>
-                <div class="login-title">Sign in to your Network Dashboard</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+    if not st.session_state.logged_in:
+        login_page()
+        return
 
-    if not st.session_state["otp_sent"]:
-        username = st.text_input("Username", key="login_username")
-        password = st.text_input("Password", type="password", key="login_password")
-        email = st.text_input("Email", key="login_email")
-        if st.button("Send OTP"):
-            if username == "NTAVis" and password == "hadifshah":
-                st.session_state["totp"] = pyotp.TOTP(pyotp.random_base32())
-                otp = st.session_state["totp"].now()
-                send_otp(otp, email)
-                st.session_state["otp_sent"] = True
-                st.success("OTP sent! Please check your email.")
-            else:
-                st.error("❌ Incorrect username or password. Please try again.")
+    st.sidebar.title(f"Welcome, {st.secrets['login']['username']}!")
+    if st.sidebar.button("Logout"):
+        for key in list(st.session_state.keys()): del st.session_state[key]
+        st.rerun()
 
-    elif not st.session_state["otp_verified"]:
-        otp_input = st.text_input("Enter OTP")
-        if st.button("Verify OTP"):
-            totp = st.session_state["totp"]
-            if totp.verify(otp_input, valid_window=1):
-                st.session_state["otp_verified"] = True
-                st.success("Login successful!")
-                st.session_state["logged_in"] = True
-                st.rerun()
-            else:
-                st.error("Invalid OTP. Please try again.")
-
-# --- Login State Management ---
-if "logged_in" not in st.session_state:
-    st.session_state["logged_in"] = False
-
-if not st.session_state["logged_in"]:
-    otp_login()
-    st.stop()
-
-# --- Dashboard ---
-st.set_page_config(page_title="Network Traffic Analysis & Visualisation", layout="wide", page_icon="🌐", initial_sidebar_state="expanded")
-st.markdown(
-    """
-    <style>
-    body, .stApp {
-        background-color: #f8f9fa !important;
-        color: #222 !important;
-    }
-    </style>
-    """, unsafe_allow_html=True
-)
-
-# --- Logout button ---
-if st.sidebar.button("Logout"):
-    st.session_state["logged_in"] = False
-    st.rerun()
-
-menu = st.sidebar.radio("📋 Menu", ["📊 Overview", "🗺️ Geo Map", "📈 Analytics"])
-
-if menu == "📊 Overview":
-    st.markdown("## 📊 Threat Overview")
-    suspicious_count, malformed_count, syn_flood_count, udp_flood_count = get_counts()
-    st.markdown(
-        """
-        <style>
-        .card {
-            background-color: #f1f3f6;
-            padding: 20px;
-            border-radius: 12px;
-            text-align: center;
-            box-shadow: 0 2px 8px rgba(44,62,80,0.08);
-            margin-bottom: 10px;
-            color: #222 !important;
-        }
-        .emoji {
-            font-size: 2rem;
-        }
-        </style>
-        """, unsafe_allow_html=True
-    )
-    col1, col2, col3, col4 = st.columns(4)
-    col1.markdown(f"<div class='card'><span class='emoji'>🕵️</span><br><b>Suspicious Packets</b><br><span style='font-size:1.5rem'>{suspicious_count}</span></div>", unsafe_allow_html=True)
-    col2.markdown(f"<div class='card'><span class='emoji'>⚠️</span><br><b>Malformed Packets</b><br><span style='font-size:1.5rem'>{malformed_count}</span></div>", unsafe_allow_html=True)
-    col3.markdown(f"<div class='card'><span class='emoji'>🌊</span><br><b>SYN Flood Events</b><br><span style='font-size:1.5rem'>{syn_flood_count}</span></div>", unsafe_allow_html=True)
-    col4.markdown(f"<div class='card'><span class='emoji'>💧</span><br><b>UDP Flood Events</b><br><span style='font-size:1.5rem'>{udp_flood_count}</span></div>", unsafe_allow_html=True)
-
-    st.markdown("---")
-    st.subheader("📂 Raw Packet Data")
+    st.sidebar.markdown("---")
+    menu = st.sidebar.radio("📋 Menu", ["📊 Overview", "🗺️ Geo Map", "📈 Analytics"])
+    
     df = get_data()
-    st.dataframe(df, use_container_width=True, height=400)
 
-    # --- Top 5 Source IPs ---
-    st.markdown("### 🌐 Top 5 Source IPs")
-    if not df.empty and "src_ip" in df.columns:
-        top_ips = df["src_ip"].value_counts().head(5).reset_index()
-        top_ips.columns = ["Source IP", "Count"]
-        st.dataframe(top_ips, use_container_width=True)
-
-elif menu == "🗺️ Geo Map":
-    st.markdown("## 🗺️ Threat Source Map")
-    df = get_data()
-    if not df.empty and "latitude" in df.columns and "longitude" in df.columns:
-        avg_lat = df["latitude"].dropna().mean() if not df["latitude"].dropna().empty else 0
-        avg_lon = df["longitude"].dropna().mean() if not df["longitude"].dropna().empty else 0
-        threat_map = folium.Map(location=[avg_lat, avg_lon], zoom_start=2)
-        for _, row in df.iterrows():
-            if pd.notnull(row["latitude"]) and pd.notnull(row["longitude"]):
-                folium.CircleMarker(
-                    location=[row["latitude"], row["longitude"]],
-                    radius=8,
-                    color="red",
-                    fill=True,
-                    fill_color="red",
-                    fill_opacity=0.8,
-                    popup=f"Source IP: {row['src_ip']}<br>Threat: {row['threat_type']}<br>Protocol: {row['protocol']}",
-                    tooltip=f"{row['src_ip']} ({row['threat_type']})"
-                ).add_to(threat_map)
-        st_folium(threat_map, width=1000, height=600)
-        st.markdown("""
-            <div style="background-color: #e3f2fd; color: #222; padding: 12px 18px; border-radius: 8px; margin-top: 10px; font-weight: 400;">
-                <span style="font-size:1.2em;">🔴 Red markers indicate detected threats by location.</span>
-            </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.markdown("""
-            <div style="background-color: #e3f2fd; color: #222; padding: 12px 18px; border-radius: 8px; margin-top: 10px; font-weight: 500;">
-                <span style="font-size:1.2em;">No geolocation data available in your packets.</span>
-            </div>
-        """, unsafe_allow_html=True)
-
-elif menu == "📈 Analytics":
-    st.subheader("📈 Threat Analytics Dashboard")
-    df = get_data()
-    if not df.empty:
-        if "timestamp" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-            df = df.dropna(subset=["timestamp"])
-
-        suspicious_count, malformed_count, syn_flood_count, udp_flood_count = get_counts()
-        card1, card2, card3, card4 = st.columns(4)
-        card1.markdown(f"<div style='background-color:#f8f9fa;padding:20px;border-radius:10px;text-align:center;color:#222'><h3>{suspicious_count}</h3><p>Suspicious Packets</p></div>", unsafe_allow_html=True)
-        card2.markdown(f"<div style='background-color:#f8f9fa;padding:20px;border-radius:10px;text-align:center;color:#222'><h3>{malformed_count}</h3><p>Malformed Packets</p></div>", unsafe_allow_html=True)
-        card3.markdown(f"<div style='background-color:#f8f9fa;padding:20px;border-radius:10px;text-align:center;color:#222'><h3>{syn_flood_count}</h3><p>SYN Flood Events</p></div>", unsafe_allow_html=True)
-        card4.markdown(f"<div style='background-color:#f8f9fa;padding:20px;border-radius:10px;text-align:center;color:#222'><h3>{udp_flood_count}</h3><p>UDP Flood Events</p></div>", unsafe_allow_html=True)
-
+    if menu == "📊 Overview":
+        st.markdown("## 📊 Threat Overview")
+        if not df.empty and 'threat_type' in df.columns:
+            threat_counts = df["threat_type"].value_counts()
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("🕵️ Suspicious", threat_counts.get("Suspicious", 0))
+            col2.metric("⚠️ Malformed", threat_counts.get("Malformed", 0))
+            col3.metric("🌊 SYN Flood", threat_counts.get("SYN Flood", 0))
+            col4.metric("💧 UDP Flood", threat_counts.get("UDP Flood", 0))
+        else:
+            st.info("No threat data available to display.")
+        
         st.markdown("---")
+        st.subheader("📂 Raw Packet Data")
+        with st.form(key='search_form'):
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                search_ip = st.text_input("Enter IP Address to filter", label_visibility="collapsed", placeholder="Enter IP Address to filter")
+            with col2:
+                search_button = st.form_submit_button(label="Search")
+        display_df = df
+        if search_button and search_ip:
+            display_df = df[df['src_ip'].str.contains(search_ip, na=False) | df['dst_ip'].str.contains(search_ip, na=False)]
+        st.dataframe(display_df, use_container_width=True)
 
-        chart1, chart2 = st.columns(2)
-        with chart1:
-            threat_counts = df["threat_type"].value_counts().reset_index()
-            threat_counts.columns = ["Threat Type", "Count"]
-            fig1 = px.bar(threat_counts, x="Threat Type", y="Count",
-                          color="Threat Type", title="Threats by Type",
-                          color_discrete_sequence=px.colors.qualitative.Safe)
-            st.plotly_chart(fig1, use_container_width=True)
-        with chart2:
-            protocol_counts = df["protocol"].value_counts().reset_index()
-            protocol_counts.columns = ["Protocol", "Count"]
-            fig2 = px.pie(protocol_counts, names="Protocol", values="Count", title="Protocol Distribution",
-                          color_discrete_sequence=px.colors.qualitative.Safe)
-            st.plotly_chart(fig2, use_container_width=True)
+    elif menu == "🗺️ Geo Map":
+        st.markdown("## 🗺️ Threat Source Map")
+        if not df.empty and "latitude" in df.columns and "longitude" in df.columns:
+            map_df = df.dropna(subset=["latitude", "longitude"])
+            if not map_df.empty:
+                avg_lat, avg_lon = map_df["latitude"].mean(), map_df["longitude"].mean()
+                m = folium.Map(location=[avg_lat, avg_lon], zoom_start=2, tiles="CartoDB positron")
+                for _, row in map_df.iterrows():
+                    folium.CircleMarker(location=[row["latitude"], row["longitude"]], radius=5, color="red", fill=True, fill_color="red", popup=f"IP: {row['src_ip']}<br>Threat: {row['threat_type']}").add_to(m)
+                st_folium(m, use_container_width=True, height=600)
+            else:
+                st.info("No geolocation data to display on the map.")
+        else:
+            st.info("No geolocation data available in your packets.")
+            
+    elif menu == "📈 Analytics":
+        st.markdown("## 📈 Analytics Dashboard")
+        if not df.empty and 'threat_type' in df.columns and 'protocol' in df.columns:
+            config = {'toImageButtonOptions': {'format': 'png', 'scale': 2}}
+            st.markdown("#### Traffic Composition")
+            col1, col2 = st.columns(2)
+            with col1:
+                threat_counts = df["threat_type"].value_counts().reset_index()
+                fig1 = px.bar(threat_counts, x="threat_type", y="count", title="Threats by Type", labels={'threat_type':'Threat Type'})
+                st.plotly_chart(fig1, use_container_width=True, config=config)
+            with col2:
+                protocol_counts = df["protocol"].value_counts().reset_index()
+                fig2 = px.pie(protocol_counts, names="protocol", values="count", title="Protocol Distribution")
+                st.plotly_chart(fig2, use_container_width=True, config=config)
+            st.markdown("---")
+            st.markdown("#### Top IP Addresses")
+            col3, col4 = st.columns(2)
+            with col3:
+                top_src_ips = df['src_ip'].value_counts().nlargest(10).reset_index()
+                fig3 = px.bar(top_src_ips, x='src_ip', y='count', title="Top 10 Source IPs")
+                st.plotly_chart(fig3, use_container_width=True, config=config)
+            with col4:
+                top_dst_ips = df['dst_ip'].value_counts().nlargest(10).reset_index()
+                fig4 = px.bar(top_dst_ips, x='dst_ip', y='count', title="Top 10 Destination IPs")
+                st.plotly_chart(fig4, use_container_width=True, config=config)
+        else:
+            st.info("No data available for analytics.")
 
-        st.markdown("---")
-        if "timestamp" in df.columns:
-            timeline = df.groupby(df["timestamp"].dt.floor("min")).size().reset_index(name="Count")
-            fig3 = px.area(timeline, x="timestamp", y="Count",
-                           title="Threats Over Time",
-                           color_discrete_sequence=["#636EFA"])
-            st.plotly_chart(fig3, use_container_width=True)
+if __name__ == "__main__":
+    if 'gmail' not in st.secrets or 'login' not in st.secrets:
+        st.error("CRITICAL: Your .streamlit/secrets.toml file is missing or incomplete.")
     else:
-        st.info("No threat data available.")
+        main()
