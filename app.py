@@ -131,34 +131,6 @@ def send_otp(otp, recipient_email):
 
 # --- Main App Logic ---
 def main():
-    # --- Demo fallback for missing secrets ---
-    if 'gmail' not in st.secrets or 'login' not in st.secrets:
-        demo_login = {"username": "DemoUser", "password": "demo123"}
-        demo_gmail = {"email": "", "app_password": ""}
-        # Patch st.secrets temporarily
-        class DemoSecrets(dict):
-            def __getitem__(self, key):
-                if key == "login":
-                    return demo_login
-                if key == "gmail":
-                    return demo_gmail
-                return {}
-        st.secrets = DemoSecrets()
-        st.warning(
-            "⚠️ Streamlit secrets are missing or incomplete. Running in demo mode."
-        )
-
-    if "logged_in" not in st.session_state: st.session_state.logged_in = False
-    if "otp_sent" not in st.session_state: st.session_state.otp_sent = False
-
-    if not st.session_state.logged_in:
-        login_page()
-        return
-
-    st.sidebar.title(f"Welcome, {st.secrets['login']['username']}!")
-    # ... rest of your original main() code follows here unchanged
-
-def main():
     if "logged_in" not in st.session_state: st.session_state.logged_in = False
     if "otp_sent" not in st.session_state: st.session_state.otp_sent = False
 
@@ -245,17 +217,8 @@ def main():
             st.info("No data available for analytics.")
 
 if __name__ == "__main__":
-    try:
-        _ = st.secrets["gmail"]
-        _ = st.secrets["login"]
-        main()
-    except Exception:
-        st.warning(
-            "⚠️ Streamlit secrets are missing or incomplete.\n\n"
-            "You can still run the dashboard in demo mode with limited functionality."
-        )
-        # Optional: allow demo mode
-        if "logged_in" not in st.session_state:
-            st.session_state.logged_in = True
+    if 'gmail' not in st.secrets or 'login' not in st.secrets:
+        st.error("CRITICAL: Your .streamlit/secrets.toml file is missing or incomplete.")
+    else:
         main()
 
